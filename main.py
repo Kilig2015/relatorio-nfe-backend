@@ -1,67 +1,56 @@
-from fastapi import FastAPI, File, UploadFile, Form
-from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-import xmltodict
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 import pandas as pd
+import io
+import xml.etree.ElementTree as ET
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.post("/gerar-relatorio")
-async def gerar_relatorio(
-    xmls: List[UploadFile] = File(...),
-    modo_linha_individual: bool = Form(False)
-):
-    linhas = []
+async def gerar_relatorio(xmls: list[UploadFile] = File(...), modo_linha_individual: bool = Form(...)):
+    dados = []
 
     for xml_file in xmls:
-        conteudo = await xml_file.read()
-        try:
-            xml_dict = xmltodict.parse(conteudo)
-            nfe = xml_dict.get("nfeProc") or xml_dict.get("NFe") or xml_dict
-            ide = nfe["NFe"]["infNFe"]["ide"]
-            emit = nfe["NFe"]["infNFe"]["emit"]
-            det = nfe["NFe"]["infNFe"]["det"]
+        content = await xml_file.read()
+        root = ET.fromstring(content)
 
-            if not isinstance(det, list):
-                det = [det]
+        # Extração de exemplo
+        refNFe = root.findtext(".//infNFe/ide/nNF")
+        emitente = root.findtext(".//emit/xNome")
+        data_emissao = root.findtext(".//ide/dhEmi")
 
-            for item in det:
-                produto = item["prod"]
-                linha = {
-                    "refNFe": ide.get("nNF", ""),
-                    "emitente": emit.get("xNome", ""),
-                    "dataEmissao": ide.get("dhEmi", ide.get("dEmi", "")),
-                    "produto": produto.get("xProd", ""),
-                    "quantidade": produto.get("qCom", ""),
-                    "valorUnitario": produto.get("vUnCom", ""),
-                    "valorTotal": produto.get("vProd", ""),
-                    "NCM": produto.get("NCM", "")
-                }
+        for det in root.findall(".//det"):
+            prod = det.find("prod")
+            produto = prod.findtext("xProd")
+            quantidade = prod.findtext("qCom")
+            valor_unit = prod.findtext("vUnCom")
+            valor_total = prod.findtext("vProd")
+            ncm = prod.findtext("NCM")
 
-                if modo_linha_individual:
-                    linhas.append(linha)
+            linha = {
+                "refNFe": refNFe,
+                "emitente": emitente,
+                "dataEmissao": data_emissao,
+                "produto": produto,
+                "quantidade": quantidade,
+                "valorUnitario": valor_unit,
+                "valorTotal": valor_total,
+                "NCM": ncm
+            }
+            dados.append(linha)
+
             if not modo_linha_individual:
-                resumo = {
-                    "refNFe": ide.get("nNF", ""),
-                    "emitente": emit.get("xNome", ""),
-                    "dataEmissao": ide.get("dhEmi", ide.get("dEmi", "")),
-                    "totalItens": len(det),
-                    "valorTotalNota": sum(float(i["prod"]["vProd"]) for i in det)
-                }
-                linhas.append(resumo)
-        except Exception as e:
-            linhas.append({"erro": f"Erro ao processar XML: {e}"})
+                break  # só pega o primeiro item
 
-    df = pd.DataFrame(linhas)
-    return {
-        "status": "ok",
-        "columns": df.columns.tolist(),
-        "rows": df.to_dict(orient="records")
-    }
+    df = pd.DataFrame(dados)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df.to_excel(writer, index=False, sheet_name='Relatório')
+
+    output.seek(0)
+    return StreamingResponse(
+        output,
+        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={"Content-Disposition": "attachment; filename=relatorio.xlsx"}
+    )
