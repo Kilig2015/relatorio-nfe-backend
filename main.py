@@ -1,56 +1,41 @@
 from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import pandas as pd
+from typing import List
 import io
-import xml.etree.ElementTree as ET
+import pandas as pd
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Em produção, especifique seu domínio
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 @app.post("/gerar-relatorio")
-async def gerar_relatorio(xmls: list[UploadFile] = File(...), modo_linha_individual: bool = Form(...)):
+async def gerar_relatorio(
+    xmls: List[UploadFile] = File(...),
+    modo_linha_individual: bool = Form(False)
+):
+    # Simulação: cria DataFrame fictício (substituir por parsing de XMLs)
     dados = []
-
-    for xml_file in xmls:
-        content = await xml_file.read()
-        root = ET.fromstring(content)
-
-        # Extração de exemplo
-        refNFe = root.findtext(".//infNFe/ide/nNF")
-        emitente = root.findtext(".//emit/xNome")
-        data_emissao = root.findtext(".//ide/dhEmi")
-
-        for det in root.findall(".//det"):
-            prod = det.find("prod")
-            produto = prod.findtext("xProd")
-            quantidade = prod.findtext("qCom")
-            valor_unit = prod.findtext("vUnCom")
-            valor_total = prod.findtext("vProd")
-            ncm = prod.findtext("NCM")
-
-            linha = {
-                "refNFe": refNFe,
-                "emitente": emitente,
-                "dataEmissao": data_emissao,
-                "produto": produto,
-                "quantidade": quantidade,
-                "valorUnitario": valor_unit,
-                "valorTotal": valor_total,
-                "NCM": ncm
-            }
-            dados.append(linha)
-
-            if not modo_linha_individual:
-                break  # só pega o primeiro item
+    for xml in xmls:
+        dados.append({
+            "refNFe": xml.filename,
+            "produto": "Produto Exemplo",
+            "valorTotal": 123.45
+        })
 
     df = pd.DataFrame(dados)
-
     output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Relatório')
-
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name="Relatório")
     output.seek(0)
     return StreamingResponse(
         output,
-        media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": "attachment; filename=relatorio.xlsx"}
     )
