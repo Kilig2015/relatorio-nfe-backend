@@ -2,13 +2,11 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-import io
+from typing import List
 import xml.etree.ElementTree as ET
 import pandas as pd
+import io
 from datetime import datetime
-from openpyxl import Workbook
-from openpyxl.styles import Font
-from typing import List
 
 NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
@@ -38,7 +36,16 @@ def buscar_valor_xpath(base, caminho):
     return atual.text if atual is not None else ''
 
 @app.post("/gerar-relatorio")
-async def gerar_relatorio(xmls: List[UploadFile] = File(...), modo_linha_individual: bool = Form(False)):
+async def gerar_relatorio(
+    xmls: List[UploadFile] = File(...),
+    modo_linha_individual: bool = Form(False),
+    dataInicio: str = Form(None),
+    dataFim: str = Form(None),
+    cfop: str = Form(None),
+    tipoNF: str = Form(None),
+    ncm: str = Form(None),
+    codigoProduto: str = Form(None)
+):
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -80,6 +87,22 @@ async def gerar_relatorio(xmls: List[UploadFile] = File(...), modo_linha_individ
                         linha[titulo] = buscar_valor_xpath(det, campo.replace('det|', ''))
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
+
+                # Aplicar filtros
+                data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
+                if dataInicio and data_emi < dataInicio:
+                    continue
+                if dataFim and data_emi > dataFim:
+                    continue
+                if cfop and linha["CFOP"] != cfop:
+                    continue
+                if tipoNF and linha["Tipo NF"] != ("0" if tipoNF == "Entrada" else "1"):
+                    continue
+                if ncm and linha["NCM"] != ncm:
+                    continue
+                if codigoProduto and linha["Código Produto"] != codigoProduto:
+                    continue
+
                 dados.append(linha)
                 if not modo_linha_individual:
                     break
@@ -89,17 +112,7 @@ async def gerar_relatorio(xmls: List[UploadFile] = File(...), modo_linha_individ
 
     df = pd.DataFrame(dados)
     output = io.BytesIO()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Relatório NFe"
-    colunas = list(df.columns)
-    ws.append(colunas)
-    for _, row in df.iterrows():
-        ws.append([row.get(col, '') for col in colunas])
-    for cell in ws[1]:
-        cell.font = Font(bold=True)
-    wb.save(output)
+    df.to_excel(output, index=False)
     output.seek(0)
-    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", headers={
-        "Content-Disposition": "attachment; filename=relatorio_nfe.xlsx"
-    })
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                              headers={"Content-Disposition": "attachment; filename=relatorio_nfe.xlsx"})
