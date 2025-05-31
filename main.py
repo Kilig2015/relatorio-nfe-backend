@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse
 from typing import List
 import xml.etree.ElementTree as ET
 import pandas as pd
@@ -10,9 +10,15 @@ NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
+# ✅ CORS configurado corretamente
+origins = [
+    "https://relatorio-nfe-frontend.vercel.app",  # Substitua com sua URL real da Vercel se for diferente
+    "http://localhost:5173"
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Recomende usar ["https://seu-frontend.vercel.app"] em produção
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -86,7 +92,7 @@ async def gerar_relatorio(
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
-                # Filtros
+                # Aplicar filtros
                 data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
                 if dataInicio and data_emi < dataInicio:
                     continue
