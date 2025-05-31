@@ -10,9 +10,8 @@ NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
-# ✅ CORS atualizado com domínio atual da Vercel
 origins = [
-    "https://kxml-x1d5zzmjb-kiligs-projects-7cfc26f2.vercel.app",
+    "https://kxml-x1d5zzmjb-kiligs-projects-7cfc26f2.vercel.app",  # seu domínio vercel
     "http://localhost:5173"
 ]
 
@@ -50,6 +49,16 @@ async def gerar_relatorio(
     ncm: str = Form(None),
     codigoProduto: str = Form(None)
 ):
+    # Corrigir filtros 'string'
+    filtros = {
+        'dataInicio': dataInicio if dataInicio and dataInicio.lower() != "string" else None,
+        'dataFim': dataFim if dataFim and dataFim.lower() != "string" else None,
+        'cfop': cfop if cfop and cfop.lower() != "string" else None,
+        'tipoNF': tipoNF if tipoNF and tipoNF.lower() != "string" else None,
+        'ncm': ncm if ncm and ncm.lower() != "string" else None,
+        'codigoProduto': codigoProduto if codigoProduto and codigoProduto.lower() != "string" else None
+    }
+
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -92,19 +101,19 @@ async def gerar_relatorio(
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
-                # Aplicar filtros
                 data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
-                if dataInicio and data_emi < dataInicio:
+
+                if filtros['dataInicio'] and data_emi < filtros['dataInicio']:
                     continue
-                if dataFim and data_emi > dataFim:
+                if filtros['dataFim'] and data_emi > filtros['dataFim']:
                     continue
-                if cfop and linha["CFOP"] != cfop:
+                if filtros['cfop'] and linha["CFOP"] != filtros['cfop']:
                     continue
-                if tipoNF and linha["Tipo NF"] != ("0" if tipoNF == "Entrada" else "1"):
+                if filtros['tipoNF'] and linha["Tipo NF"] != ("0" if filtros['tipoNF'] == "Entrada" else "1"):
                     continue
-                if ncm and linha["NCM"] != ncm:
+                if filtros['ncm'] and linha["NCM"] != filtros['ncm']:
                     continue
-                if codigoProduto and linha["Código Produto"] != codigoProduto:
+                if filtros['codigoProduto'] and linha["Código Produto"] != filtros['codigoProduto']:
                     continue
 
                 dados.append(linha)
