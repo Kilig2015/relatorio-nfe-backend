@@ -10,9 +10,9 @@ NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
-# ✅ CORS configurado corretamente
+# ✅ CORS atualizado com domínio atual da Vercel
 origins = [
-    "https://relatorio-nfe-frontend.vercel.app",  # Substitua com sua URL real da Vercel se for diferente
+    "https://kxml-x1d5zzmjb-kiligs-projects-7cfc26f2.vercel.app",
     "http://localhost:5173"
 ]
 
