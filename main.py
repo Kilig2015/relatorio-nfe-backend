@@ -1,17 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from typing import List
+from typing import List, Optional
 import xml.etree.ElementTree as ET
 import pandas as pd
 import io
+import zipfile
 
 NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
 origins = [
-    "https://kxml-x1d5zzmjb-kiligs-projects-7cfc26f2.vercel.app",  # seu domínio vercel
+    "https://kxml-x1d5zzmjb-kiligs-projects-7cfc26f2.vercel.app",
     "http://localhost:5173"
 ]
 
@@ -38,18 +39,32 @@ def buscar_valor_xpath(base, caminho):
         atual = atual.find(f'nfe:{parte}', NS)
     return atual.text if atual is not None else ''
 
+def extrair_arquivos_xml(uploaded_files: List[UploadFile]) -> List[bytes]:
+    arquivos_xml = []
+
+    for file in uploaded_files:
+        if file.filename.endswith('.zip'):
+            with zipfile.ZipFile(file.file) as zip_file:
+                for name in zip_file.namelist():
+                    if name.lower().endswith('.xml'):
+                        with zip_file.open(name) as xml_file:
+                            arquivos_xml.append(xml_file.read())
+        elif file.filename.lower().endswith('.xml'):
+            arquivos_xml.append(file.file.read())
+
+    return arquivos_xml
+
 @app.post("/gerar-relatorio")
 async def gerar_relatorio(
     xmls: List[UploadFile] = File(...),
     modo_linha_individual: bool = Form(False),
-    dataInicio: str = Form(None),
-    dataFim: str = Form(None),
-    cfop: str = Form(None),
-    tipoNF: str = Form(None),
-    ncm: str = Form(None),
-    codigoProduto: str = Form(None)
+    dataInicio: Optional[str] = Form(None),
+    dataFim: Optional[str] = Form(None),
+    cfop: Optional[str] = Form(None),
+    tipoNF: Optional[str] = Form(None),
+    ncm: Optional[str] = Form(None),
+    codigoProduto: Optional[str] = Form(None)
 ):
-    # Corrigir filtros 'string'
     filtros = {
         'dataInicio': dataInicio if dataInicio and dataInicio.lower() != "string" else None,
         'dataFim': dataFim if dataFim and dataFim.lower() != "string" else None,
@@ -79,16 +94,18 @@ async def gerar_relatorio(
 
     dados = []
 
-    for xml in xmls:
+    arquivos_xml = extrair_arquivos_xml(xmls)
+
+    for conteudo in arquivos_xml:
         try:
-            tree = ET.parse(xml.file)
+            tree = ET.ElementTree(ET.fromstring(conteudo))
             root = tree.getroot()
             infNFe = root.find('.//nfe:infNFe', NS)
             protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
-            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
+            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '') if infNFe is not None else ''
             xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
 
-            dets = infNFe.findall('nfe:det', NS)
+            dets = infNFe.findall('nfe:det', NS) if infNFe is not None else []
             for det in dets:
                 linha = {}
                 for campo, titulo in CAMPOS.items():
@@ -131,6 +148,7 @@ async def gerar_relatorio(
     output = io.BytesIO()
     df.to_excel(output, index=False)
     output.seek(0)
+
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
