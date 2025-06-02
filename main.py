@@ -1,27 +1,27 @@
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
 from typing import List, Optional
-from uuid import uuid4
-import os, shutil, zipfile, xml.etree.ElementTree as ET, pandas as pd, io
+import xml.etree.ElementTree as ET
+import pandas as pd
+import io, os, shutil, uuid, zipfile
 from datetime import datetime
-
-# Configurações
-TEMP_FOLDER = "tarefas"
-os.makedirs(TEMP_FOLDER, exist_ok=True)
-
-NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+from pathlib import Path
 
 app = FastAPI()
 
-# CORS para ambiente Vercel (ajuste seu domínio se necessário)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://kxml-9g6sj9ab8-kiligs-projects-7cfc26f2.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+OUTPUT_DIR = "output"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def buscar_valor_xpath(base, caminho):
     partes = caminho.split('|')
@@ -40,7 +40,6 @@ def buscar_valor_xpath(base, caminho):
 
 @app.post("/gerar-relatorio")
 async def gerar_relatorio(
-    background_tasks: BackgroundTasks,
     xmls: List[UploadFile] = File(...),
     modo_linha_individual: bool = Form(False),
     dataInicio: Optional[str] = Form(None),
@@ -50,30 +49,29 @@ async def gerar_relatorio(
     ncm: Optional[str] = Form(None),
     codigoProduto: Optional[str] = Form(None)
 ):
-    task_id = str(uuid4())
-    task_folder = os.path.join(TEMP_FOLDER, task_id)
-    os.makedirs(task_folder, exist_ok=True)
+    task_id = str(uuid.uuid4())
+    task_folder = Path(OUTPUT_DIR) / task_id
+    task_folder.mkdir(parents=True, exist_ok=True)
 
-    # Salvar arquivos
-    for file in xmls:
-        file_path = os.path.join(task_folder, file.filename)
-        with open(file_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+    xml_paths = []
 
-    # Descompactar se for .zip
-    for file in xmls:
-        if file.filename.endswith(".zip"):
-            with zipfile.ZipFile(os.path.join(task_folder, file.filename), 'r') as zip_ref:
+    for upload in xmls:
+        if upload.filename.lower().endswith(".zip"):
+            zip_path = task_folder / upload.filename
+            with open(zip_path, "wb") as buffer:
+                shutil.copyfileobj(upload.file, buffer)
+
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 zip_ref.extractall(task_folder)
-            os.remove(os.path.join(task_folder, file.filename))
+                for file in zip_ref.namelist():
+                    if file.lower().endswith('.xml'):
+                        xml_paths.append(task_folder / file)
+        elif upload.filename.lower().endswith(".xml"):
+            dest = task_folder / upload.filename
+            with open(dest, "wb") as buffer:
+                shutil.copyfileobj(upload.file, buffer)
+            xml_paths.append(dest)
 
-    # Rodar tarefa em background
-    background_tasks.add_task(processar_tarefa, task_id, modo_linha_individual, dataInicio, dataFim, cfop, tipoNF, ncm, codigoProduto)
-
-    return {"message": "Processamento iniciado", "task_id": task_id}
-
-async def processar_tarefa(task_id, modo_individual, dataInicio, dataFim, cfop, tipoNF, ncm, cod_produto):
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -92,14 +90,11 @@ async def processar_tarefa(task_id, modo_individual, dataInicio, dataFim, cfop, 
         "chNFe": "Chave de Acesso",
     }
 
-    task_folder = os.path.join(TEMP_FOLDER, task_id)
     dados = []
 
-    arquivos = [os.path.join(task_folder, f) for f in os.listdir(task_folder) if f.endswith('.xml')]
-
-    for path in arquivos:
+    for xml_path in xml_paths:
         try:
-            tree = ET.parse(path)
+            tree = ET.parse(xml_path)
             root = tree.getroot()
             infNFe = root.find('.//nfe:infNFe', NS)
             protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
@@ -130,33 +125,36 @@ async def processar_tarefa(task_id, modo_individual, dataInicio, dataFim, cfop, 
                     continue
                 if ncm and linha["NCM"] != ncm:
                     continue
-                if cod_produto and linha["Código Produto"] != cod_produto:
+                if codigoProduto and linha["Código Produto"] != codigoProduto:
                     continue
 
                 dados.append(linha)
-                if not modo_individual:
+                if not modo_linha_individual:
                     break
 
         except Exception as e:
-            print(f"Erro ao processar: {e}")
+            print(f"Erro ao processar {xml_path.name}: {e}")
+
+    if not dados:
+        return JSONResponse(status_code=400, content={"detail": "Nenhum dado encontrado após aplicar os filtros."})
 
     df = pd.DataFrame(dados)
-    output_path = os.path.join(task_folder, "relatorio_nfe.xlsx")
-    df.to_excel(output_path, index=False)
+    output_file = task_folder / "relatorio_nfe.xlsx"
+    df.to_excel(output_file, index=False)
+
+    return {"task_id": task_id}
 
 @app.get("/status/{task_id}")
-def verificar_status(task_id: str):
-    task_folder = os.path.join(TEMP_FOLDER, task_id)
-    if not os.path.exists(task_folder):
-        return JSONResponse(status_code=404, content={"detail": "ID não encontrado"})
-    if os.path.exists(os.path.join(task_folder, "relatorio_nfe.xlsx")):
-        return {"status": "pronto", "download_url": f"/download/{task_id}"}
+async def status(task_id: str):
+    path = Path(OUTPUT_DIR) / task_id / "relatorio_nfe.xlsx"
+    if path.exists():
+        return {"status": "pronto"}
     return {"status": "processando"}
 
 @app.get("/download/{task_id}")
-def baixar_arquivo(task_id: str):
-    task_folder = os.path.join(TEMP_FOLDER, task_id)
-    file_path = os.path.join(task_folder, "relatorio_nfe.xlsx")
-    if not os.path.exists(file_path):
-        return JSONResponse(status_code=404, content={"detail": "Arquivo ainda não gerado"})
-    return FileResponse(file_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename="relatorio_nfe.xlsx")
+async def download(task_id: str):
+    path = Path(OUTPUT_DIR) / task_id / "relatorio_nfe.xlsx"
+    if path.exists():
+        return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            filename="relatorio_nfe.xlsx")
+    return JSONResponse(status_code=404, content={"detail": "Arquivo não encontrado."})
