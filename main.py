@@ -1,24 +1,21 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from typing import List
 import xml.etree.ElementTree as ET
 import pandas as pd
 import io
+from datetime import datetime
 import zipfile
-import tempfile
-import os
 
 NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
-# CORS — substitua pelo domínio atual da Vercel
+# Liberar acesso para qualquer frontend (pode restringir depois)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://kxml-9g6sj9ab8-kiligs-projects-7cfc26f2.vercel.app"
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,6 +26,12 @@ def buscar_valor_xpath(base, caminho):
     atual = base
     for parte in partes:
         if atual is None:
+            return ''
+        if parte == '*':
+            for subtag in atual:
+                valor = subtag.find(f'nfe:{partes[-1]}', NS)
+                if valor is not None:
+                    return valor.text
             return ''
         atual = atual.find(f'nfe:{parte}', NS)
     return atual.text if atual is not None else ''
@@ -44,6 +47,14 @@ async def gerar_relatorio(
     ncm: str = Form(None),
     codigoProduto: str = Form(None)
 ):
+    # Limpeza dos filtros inválidos
+    dataInicio = None if dataInicio in (None, '', 'string') else dataInicio
+    dataFim = None if dataFim in (None, '', 'string') else dataFim
+    cfop = None if cfop in (None, '', 'string') else cfop
+    tipoNF = None if tipoNF in (None, '', 'string') else tipoNF
+    ncm = None if ncm in (None, '', 'string') else ncm
+    codigoProduto = None if codigoProduto in (None, '', 'string') else codigoProduto
+
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -62,38 +73,29 @@ async def gerar_relatorio(
         "chNFe": "Chave de Acesso",
     }
 
+    arquivos_processados = []
+
+    for arquivo in xmls:
+        if arquivo.filename.lower().endswith('.zip'):
+            with zipfile.ZipFile(arquivo.file) as z:
+                for nome_arquivo in z.namelist():
+                    if nome_arquivo.lower().endswith('.xml'):
+                        with z.open(nome_arquivo) as f:
+                            arquivos_processados.append(f.read())
+        elif arquivo.filename.lower().endswith('.xml'):
+            arquivos_processados.append(await arquivo.read())
+
     dados = []
-    arquivos = []
 
-    if len(xmls) == 1 and xmls[0].filename.endswith('.zip'):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            zip_path = os.path.join(tmpdir, xmls[0].filename)
-            with open(zip_path, "wb") as f:
-                f.write(await xmls[0].read())
-
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(tmpdir)
-                for name in zip_ref.namelist():
-                    if name.endswith('.xml'):
-                        path = os.path.join(tmpdir, name)
-                        if os.path.isfile(path):
-                            with open(path, "rb") as xml_file:
-                                arquivos.append(xml_file.read())
-    else:
-        for file in xmls:
-            arquivos.append(await file.read())
-
-    for xml_content in arquivos:
+    for xml_bytes in arquivos_processados:
         try:
-            root = ET.fromstring(xml_content)
+            root = ET.fromstring(xml_bytes)
             infNFe = root.find('.//nfe:infNFe', NS)
             protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
-            if infNFe is None:
-                continue
-            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
+            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '') if infNFe is not None else ''
             xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
-            dets = infNFe.findall('nfe:det', NS)
 
+            dets = infNFe.findall('nfe:det', NS) if infNFe is not None else []
             for det in dets:
                 linha = {}
                 for campo, titulo in CAMPOS.items():
@@ -106,6 +108,7 @@ async def gerar_relatorio(
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
+                # Filtros
                 data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
                 if dataInicio and data_emi < dataInicio:
                     continue
@@ -123,10 +126,14 @@ async def gerar_relatorio(
                 dados.append(linha)
                 if not modo_linha_individual:
                     break
+
         except Exception as e:
             print(f"Erro ao processar XML: {e}")
 
-    df = pd.DataFrame(dados) if dados else pd.DataFrame([{"Aviso": "Nenhum dado encontrado após aplicar os filtros."}])
+    if not dados:
+        return JSONResponse(status_code=400, content={"detail": "Nenhum dado encontrado após aplicar os filtros."})
+
+    df = pd.DataFrame(dados)
     output = io.BytesIO()
     df.to_excel(output, index=False)
     output.seek(0)
