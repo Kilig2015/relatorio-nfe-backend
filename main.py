@@ -1,32 +1,30 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, FileResponse
-from typing import List, Optional
+from fastapi.responses import StreamingResponse, JSONResponse
+from typing import List
 import xml.etree.ElementTree as ET
 import pandas as pd
-import io, os, shutil, uuid, zipfile
-from datetime import datetime
-from pathlib import Path
+import io
+import zipfile
+import tempfile
+import os
+
+NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://kxml-9g6sj9ab8-kiligs-projects-7cfc26f2.vercel.app"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-OUTPUT_DIR = "output"
-
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-
 def buscar_valor_xpath(base, caminho):
     partes = caminho.split('|')
     atual = base
-    for parte in partes:
+    for i, parte in enumerate(partes):
         if atual is None:
             return ''
         if parte == '*':
@@ -38,39 +36,27 @@ def buscar_valor_xpath(base, caminho):
         atual = atual.find(f'nfe:{parte}', NS)
     return atual.text if atual is not None else ''
 
+def limpar(valor):
+    return valor if valor and valor.lower() != "string" else None
+
 @app.post("/gerar-relatorio")
 async def gerar_relatorio(
     xmls: List[UploadFile] = File(...),
     modo_linha_individual: bool = Form(False),
-    dataInicio: Optional[str] = Form(None),
-    dataFim: Optional[str] = Form(None),
-    cfop: Optional[str] = Form(None),
-    tipoNF: Optional[str] = Form(None),
-    ncm: Optional[str] = Form(None),
-    codigoProduto: Optional[str] = Form(None)
+    dataInicio: str = Form(None),
+    dataFim: str = Form(None),
+    cfop: str = Form(None),
+    tipoNF: str = Form(None),
+    ncm: str = Form(None),
+    codigoProduto: str = Form(None)
 ):
-    task_id = str(uuid.uuid4())
-    task_folder = Path(OUTPUT_DIR) / task_id
-    task_folder.mkdir(parents=True, exist_ok=True)
-
-    xml_paths = []
-
-    for upload in xmls:
-        if upload.filename.lower().endswith(".zip"):
-            zip_path = task_folder / upload.filename
-            with open(zip_path, "wb") as buffer:
-                shutil.copyfileobj(upload.file, buffer)
-
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                zip_ref.extractall(task_folder)
-                for file in zip_ref.namelist():
-                    if file.lower().endswith('.xml'):
-                        xml_paths.append(task_folder / file)
-        elif upload.filename.lower().endswith(".xml"):
-            dest = task_folder / upload.filename
-            with open(dest, "wb") as buffer:
-                shutil.copyfileobj(upload.file, buffer)
-            xml_paths.append(dest)
+    # Limpar filtros
+    dataInicio = limpar(dataInicio)
+    dataFim = limpar(dataFim)
+    cfop = limpar(cfop)
+    tipoNF = limpar(tipoNF)
+    ncm = limpar(ncm)
+    codigoProduto = limpar(codigoProduto)
 
     CAMPOS = {
         "ide|nNF": "Número NF",
@@ -90,11 +76,33 @@ async def gerar_relatorio(
         "chNFe": "Chave de Acesso",
     }
 
+    arquivos_processados = []
+
+    for upload in xmls:
+        filename = upload.filename.lower()
+        if filename.endswith('.zip'):
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                zip_path = os.path.join(tmpdirname, "temp.zip")
+                with open(zip_path, "wb") as f:
+                    f.write(await upload.read())
+
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(tmpdirname)
+
+                for nome_arquivo in os.listdir(tmpdirname):
+                    if nome_arquivo.endswith(".xml"):
+                        arquivos_processados.append(os.path.join(tmpdirname, nome_arquivo))
+        elif filename.endswith('.xml'):
+            content = await upload.read()
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
+                tmp.write(content)
+                arquivos_processados.append(tmp.name)
+
     dados = []
 
-    for xml_path in xml_paths:
+    for caminho in arquivos_processados:
         try:
-            tree = ET.parse(xml_path)
+            tree = ET.parse(caminho)
             root = tree.getroot()
             infNFe = root.find('.//nfe:infNFe', NS)
             protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
@@ -114,6 +122,7 @@ async def gerar_relatorio(
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
+                # Aplicar filtros
                 data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
                 if dataInicio and data_emi < dataInicio:
                     continue
@@ -133,28 +142,14 @@ async def gerar_relatorio(
                     break
 
         except Exception as e:
-            print(f"Erro ao processar {xml_path.name}: {e}")
+            print(f"Erro ao processar XML: {e}")
 
     if not dados:
         return JSONResponse(status_code=400, content={"detail": "Nenhum dado encontrado após aplicar os filtros."})
 
     df = pd.DataFrame(dados)
-    output_file = task_folder / "relatorio_nfe.xlsx"
-    df.to_excel(output_file, index=False)
-
-    return {"task_id": task_id}
-
-@app.get("/status/{task_id}")
-async def status(task_id: str):
-    path = Path(OUTPUT_DIR) / task_id / "relatorio_nfe.xlsx"
-    if path.exists():
-        return {"status": "pronto"}
-    return {"status": "processando"}
-
-@app.get("/download/{task_id}")
-async def download(task_id: str):
-    path = Path(OUTPUT_DIR) / task_id / "relatorio_nfe.xlsx"
-    if path.exists():
-        return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            filename="relatorio_nfe.xlsx")
-    return JSONResponse(status_code=404, content={"detail": "Arquivo não encontrado."})
+    output = io.BytesIO()
+    df.to_excel(output, index=False)
+    output.seek(0)
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                              headers={"Content-Disposition": "attachment; filename=relatorio_nfe.xlsx"})
