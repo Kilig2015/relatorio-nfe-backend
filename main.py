@@ -7,16 +7,17 @@ import pandas as pd
 import io
 import zipfile
 import tempfile
+import os
 
 NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
-# CORS para frontend Vercel
+# CORS — substitua pelo domínio atual da Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://kxml-5n2a85vzg-kiligs-projects-7cfc26f2.vercel.app"
+        "https://kxml-9g6sj9ab8-kiligs-projects-7cfc26f2.vercel.app"
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -64,26 +65,31 @@ async def gerar_relatorio(
     dados = []
     arquivos = []
 
-    # Detectar se é ZIP
     if len(xmls) == 1 and xmls[0].filename.endswith('.zip'):
         with tempfile.TemporaryDirectory() as tmpdir:
-            zip_path = f"{tmpdir}/{xmls[0].filename}"
+            zip_path = os.path.join(tmpdir, xmls[0].filename)
             with open(zip_path, "wb") as f:
                 f.write(await xmls[0].read())
+
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(tmpdir)
                 for name in zip_ref.namelist():
-                    if name.endswith(".xml"):
-                        arquivos.append(open(f"{tmpdir}/{name}", "rb"))
+                    if name.endswith('.xml'):
+                        path = os.path.join(tmpdir, name)
+                        if os.path.isfile(path):
+                            with open(path, "rb") as xml_file:
+                                arquivos.append(xml_file.read())
     else:
-        arquivos = [file.file for file in xmls]
+        for file in xmls:
+            arquivos.append(await file.read())
 
-    for file in arquivos:
+    for xml_content in arquivos:
         try:
-            tree = ET.parse(file)
-            root = tree.getroot()
+            root = ET.fromstring(xml_content)
             infNFe = root.find('.//nfe:infNFe', NS)
             protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
+            if infNFe is None:
+                continue
             chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
             xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
             dets = infNFe.findall('nfe:det', NS)
@@ -100,7 +106,6 @@ async def gerar_relatorio(
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
-                # Aplicar filtros (somente se preenchidos)
                 data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
                 if dataInicio and data_emi < dataInicio:
                     continue
@@ -118,16 +123,10 @@ async def gerar_relatorio(
                 dados.append(linha)
                 if not modo_linha_individual:
                     break
-
         except Exception as e:
             print(f"Erro ao processar XML: {e}")
 
-    # ✅ Geração de Excel mesmo que vazio
-    if not dados:
-        df = pd.DataFrame([{"AVISO": "Nenhum dado encontrado após aplicar os filtros."}])
-    else:
-        df = pd.DataFrame(dados)
-
+    df = pd.DataFrame(dados) if dados else pd.DataFrame([{"Aviso": "Nenhum dado encontrado após aplicar os filtros."}])
     output = io.BytesIO()
     df.to_excel(output, index=False)
     output.seek(0)
