@@ -24,7 +24,7 @@ app.add_middleware(
 def buscar_valor_xpath(base, caminho):
     partes = caminho.split('|')
     atual = base
-    for i, parte in enumerate(partes):
+    for parte in partes:
         if atual is None:
             return ''
         if parte == '*':
@@ -37,7 +37,7 @@ def buscar_valor_xpath(base, caminho):
     return atual.text if atual is not None else ''
 
 def limpar(valor):
-    return valor if valor and valor.lower() != "string" else None
+    return valor if valor and valor.strip().lower() not in ["string", ""] else None
 
 @app.post("/gerar-relatorio")
 async def gerar_relatorio(
@@ -50,7 +50,7 @@ async def gerar_relatorio(
     ncm: str = Form(None),
     codigoProduto: str = Form(None)
 ):
-    # Limpar filtros
+    # Sanitize filtros
     dataInicio = limpar(dataInicio)
     dataFim = limpar(dataFim)
     cfop = limpar(cfop)
@@ -89,9 +89,10 @@ async def gerar_relatorio(
                 with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                     zip_ref.extractall(tmpdirname)
 
-                for nome_arquivo in os.listdir(tmpdirname):
-                    if nome_arquivo.endswith(".xml"):
-                        arquivos_processados.append(os.path.join(tmpdirname, nome_arquivo))
+                for root_dir, _, files in os.walk(tmpdirname):
+                    for nome in files:
+                        if nome.endswith(".xml"):
+                            arquivos_processados.append(os.path.join(root_dir, nome))
         elif filename.endswith('.xml'):
             content = await upload.read()
             with tempfile.NamedTemporaryFile(delete=False, suffix=".xml") as tmp:
@@ -142,7 +143,7 @@ async def gerar_relatorio(
                     break
 
         except Exception as e:
-            print(f"Erro ao processar XML: {e}")
+            print(f"[ERRO XML] {e} - {caminho}")
 
     if not dados:
         return JSONResponse(status_code=400, content={"detail": "Nenhum dado encontrado após aplicar os filtros."})
