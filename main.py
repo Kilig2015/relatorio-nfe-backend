@@ -1,25 +1,26 @@
 from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
 from typing import List, Optional
-import xml.etree.ElementTree as ET
-import pandas as pd
-import io, os, uuid, shutil, zipfile
+from uuid import uuid4
+import os, shutil, zipfile, xml.etree.ElementTree as ET, pandas as pd
 from datetime import datetime
+
+TEMP_FOLDER = "tarefas"
+os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
+# CORS para produção (ajuste seu domínio se quiser restringir)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # ajuste para ['https://seu-dominio.vercel.app'] se quiser restringir
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-OUTPUT_DIR = "relatorios"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def buscar_valor_xpath(base, caminho):
     partes = caminho.split('|')
@@ -36,7 +37,47 @@ def buscar_valor_xpath(base, caminho):
         atual = atual.find(f'nfe:{parte}', NS)
     return atual.text if atual is not None else ''
 
-def processar_xmls_e_salvar(xmls, filtros, modo_linha_individual, filename):
+@app.post("/gerar-relatorio")
+async def gerar_relatorio(
+    background_tasks: BackgroundTasks,
+    xmls: List[UploadFile] = File(...),
+    modo_linha_individual: bool = Form(False),
+    dataInicio: Optional[str] = Form(None),
+    dataFim: Optional[str] = Form(None),
+    cfop: Optional[str] = Form(None),
+    tipoNF: Optional[str] = Form(None),
+    ncm: Optional[str] = Form(None),
+    codigoProduto: Optional[str] = Form(None)
+):
+    task_id = str(uuid4())
+    task_folder = os.path.join(TEMP_FOLDER, task_id)
+    os.makedirs(task_folder, exist_ok=True)
+
+    for file in xmls:
+        path = os.path.join(task_folder, file.filename)
+        with open(path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+
+    # Descompactar arquivos zip
+    for file in xmls:
+        if file.filename.endswith(".zip"):
+            try:
+                zip_path = os.path.join(task_folder, file.filename)
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(task_folder)
+                os.remove(zip_path)
+            except Exception as e:
+                return JSONResponse(status_code=400, content={"detail": f"Erro ao extrair ZIP: {e}"})
+
+    background_tasks.add_task(
+        processar_tarefa,
+        task_id, modo_linha_individual,
+        dataInicio, dataFim, cfop, tipoNF, ncm, codigoProduto
+    )
+    return {"message": "Processamento iniciado", "task_id": task_id}
+
+async def processar_tarefa(task_id, modo_individual, dataInicio, dataFim, cfop, tipoNF, ncm, cod_produto):
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -55,18 +96,20 @@ def processar_xmls_e_salvar(xmls, filtros, modo_linha_individual, filename):
         "chNFe": "Chave de Acesso",
     }
 
+    task_folder = os.path.join(TEMP_FOLDER, task_id)
+    arquivos = [os.path.join(task_folder, f) for f in os.listdir(task_folder) if f.endswith('.xml')]
     dados = []
 
-    for xml_path in xmls:
+    for path in arquivos:
         try:
-            tree = ET.parse(xml_path)
+            tree = ET.parse(path)
             root = tree.getroot()
             infNFe = root.find('.//nfe:infNFe', NS)
             protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
             chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
             xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
-
             dets = infNFe.findall('nfe:det', NS)
+
             for det in dets:
                 linha = {}
                 for campo, titulo in CAMPOS.items():
@@ -79,98 +122,49 @@ def processar_xmls_e_salvar(xmls, filtros, modo_linha_individual, filename):
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
-                # filtros
                 data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
-                if filtros["dataInicio"] and data_emi < filtros["dataInicio"]:
+                if dataInicio and data_emi < dataInicio:
                     continue
-                if filtros["dataFim"] and data_emi > filtros["dataFim"]:
+                if dataFim and data_emi > dataFim:
                     continue
-                if filtros["cfop"] and linha["CFOP"] != filtros["cfop"]:
+                if cfop and linha["CFOP"] != cfop:
                     continue
-                if filtros["tipoNF"] and linha["Tipo NF"] != ("0" if filtros["tipoNF"] == "Entrada" else "1"):
+                if tipoNF and linha["Tipo NF"] != ("0" if tipoNF == "Entrada" else "1"):
                     continue
-                if filtros["ncm"] and linha["NCM"] != filtros["ncm"]:
+                if ncm and linha["NCM"] != ncm:
                     continue
-                if filtros["codigoProduto"] and linha["Código Produto"] != filtros["codigoProduto"]:
+                if cod_produto and linha["Código Produto"] != cod_produto:
                     continue
 
                 dados.append(linha)
-                if not modo_linha_individual:
+                if not modo_individual:
                     break
-
         except Exception as e:
-            print(f"Erro ao processar XML: {e}")
+            print(f"Erro ao processar {path}: {e}")
 
+    output_path = os.path.join(task_folder, "relatorio_nfe.xlsx")
     if not dados:
-        return False
+        with open(output_path, "w") as f:
+            f.write("Nenhum dado encontrado após aplicar os filtros.")
+    else:
+        df = pd.DataFrame(dados)
+        df.to_excel(output_path, index=False)
 
-    df = pd.DataFrame(dados)
-    df.to_excel(filename, index=False)
-    return True
+@app.get("/status/{task_id}")
+def verificar_status(task_id: str):
+    task_folder = os.path.join(TEMP_FOLDER, task_id)
+    file_path = os.path.join(task_folder, "relatorio_nfe.xlsx")
+    if os.path.exists(file_path):
+        return {"status": "pronto", "download_url": f"/download/{task_id}"}
+    elif os.path.exists(task_folder):
+        return {"status": "processando"}
+    else:
+        return JSONResponse(status_code=404, content={"detail": "ID não encontrado"})
 
-@app.post("/gerar-relatorio")
-async def gerar_relatorio(
-    background_tasks: BackgroundTasks,
-    xmls: List[UploadFile] = File(...),
-    modo_linha_individual: bool = Form(False),
-    dataInicio: Optional[str] = Form(None),
-    dataFim: Optional[str] = Form(None),
-    cfop: Optional[str] = Form(None),
-    tipoNF: Optional[str] = Form(None),
-    ncm: Optional[str] = Form(None),
-    codigoProduto: Optional[str] = Form(None)
-):
-    filtros = {
-        "dataInicio": dataInicio,
-        "dataFim": dataFim,
-        "cfop": cfop,
-        "tipoNF": tipoNF,
-        "ncm": ncm,
-        "codigoProduto": codigoProduto,
-    }
-
-    temp_dir = f"temp_{uuid.uuid4().hex}"
-    os.makedirs(temp_dir, exist_ok=True)
-    xml_paths = []
-
-    for file in xmls:
-        if file.filename.lower().endswith('.zip'):
-            zip_path = os.path.join(temp_dir, file.filename)
-            with open(zip_path, 'wb') as f:
-                f.write(await file.read())
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(temp_dir)
-            for root_dir, _, files in os.walk(temp_dir):
-                for name in files:
-                    if name.lower().endswith(".xml"):
-                        xml_paths.append(os.path.join(root_dir, name))
-        elif file.filename.lower().endswith('.xml'):
-            path = os.path.join(temp_dir, file.filename)
-            with open(path, 'wb') as f:
-                f.write(await file.read())
-            xml_paths.append(path)
-
-    if not xml_paths:
-        shutil.rmtree(temp_dir)
-        return JSONResponse(status_code=400, content={"detail": "Nenhum XML encontrado."})
-
-    report_id = uuid.uuid4().hex
-    output_path = os.path.join(OUTPUT_DIR, f"relatorio_{report_id}.xlsx")
-
-    def processar():
-        sucesso = processar_xmls_e_salvar(xml_paths, filtros, modo_linha_individual, output_path)
-        shutil.rmtree(temp_dir)
-        if not sucesso:
-            if os.path.exists(output_path):
-                os.remove(output_path)
-
-    background_tasks.add_task(processar)
-
-    return {"link": f"https://relatorio-nfe-backend.onrender.com/download/relatorio_{report_id}.xlsx"}
-
-@app.get("/download/{filename}")
-def baixar_arquivo(filename: str):
-    path = os.path.join(OUTPUT_DIR, filename)
-    if not os.path.exists(path):
-        return JSONResponse(status_code=404, content={"detail": "Arquivo não encontrado."})
-    return FileResponse(path, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', filename=filename)
+@app.get("/download/{task_id}")
+def baixar_arquivo(task_id: str):
+    task_folder = os.path.join(TEMP_FOLDER, task_id)
+    file_path = os.path.join(task_folder, "relatorio_nfe.xlsx")
+    if not os.path.exists(file_path):
+        return JSONResponse(status_code=404, content={"detail": "Arquivo ainda não gerado"})
+    return FileResponse(file_path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename="relatorio_nfe.xlsx")
