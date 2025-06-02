@@ -1,14 +1,10 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from typing import List, Optional
+from typing import List
+import zipfile, tempfile, io, os
 import xml.etree.ElementTree as ET
 import pandas as pd
-import io
-import zipfile
-import tempfile
-import os
-from datetime import datetime
 
 NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
@@ -16,7 +12,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Altere se quiser restringir para seu domínio da Vercel
+    allow_origins=["*"],  # Em produção, especifique o domínio
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -30,41 +26,21 @@ def buscar_valor_xpath(base, caminho):
             return ''
         if parte == '*':
             for subtag in atual:
-                valor = subtag.find(f'nfe:{partes[-1]}', NS)
-                if valor is not None:
-                    return valor.text
+                resultado = subtag.find(f'nfe:{partes[-1]}', NS)
+                if resultado is not None:
+                    return resultado.text
             return ''
         atual = atual.find(f'nfe:{parte}', NS)
     return atual.text if atual is not None else ''
 
-def extrair_xmls(files: List[UploadFile]):
-    xmls = []
-    for file in files:
-        if file.filename.lower().endswith('.zip'):
-            with tempfile.TemporaryDirectory() as tmpdirname:
-                zip_path = os.path.join(tmpdirname, file.filename)
-                with open(zip_path, 'wb') as f:
-                    f.write(file.file.read())
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    for name in zip_ref.namelist():
-                        if name.lower().endswith('.xml'):
-                            xml_content = zip_ref.read(name)
-                            xmls.append(xml_content)
-        elif file.filename.lower().endswith('.xml'):
-            xmls.append(file.file.read())
-    return xmls
+def processar_xml(conteudo_xml, filtros, modo_individual):
+    tree = ET.parse(io.BytesIO(conteudo_xml))
+    root = tree.getroot()
+    infNFe = root.find('.//nfe:infNFe', NS)
+    protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
+    chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
+    xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
 
-@app.post("/gerar-relatorio")
-async def gerar_relatorio(
-    xmls: List[UploadFile] = File(...),
-    modo_linha_individual: bool = Form(False),
-    dataInicio: Optional[str] = Form(None),
-    dataFim: Optional[str] = Form(None),
-    cfop: Optional[str] = Form(None),
-    tipoNF: Optional[str] = Form(None),
-    ncm: Optional[str] = Form(None),
-    codigoProduto: Optional[str] = Form(None)
-):
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -83,63 +59,91 @@ async def gerar_relatorio(
         "chNFe": "Chave de Acesso",
     }
 
-    conteudos = extrair_xmls(xmls)
     dados = []
+    dets = infNFe.findall('nfe:det', NS)
+    for det in dets:
+        linha = {}
+        for campo, titulo in CAMPOS.items():
+            if campo == 'xMotivo':
+                linha[titulo] = xMotivo
+            elif campo == 'chNFe':
+                linha[titulo] = chNFe
+            elif campo.startswith('det|'):
+                linha[titulo] = buscar_valor_xpath(det, campo.replace('det|', ''))
+            else:
+                linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
-    for conteudo in conteudos:
+        # Aplicar filtros (opcional)
+        data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
+        if filtros['dataInicio'] and data_emi < filtros['dataInicio']:
+            continue
+        if filtros['dataFim'] and data_emi > filtros['dataFim']:
+            continue
+        if filtros['cfop'] and linha["CFOP"] != filtros['cfop']:
+            continue
+        if filtros['tipoNF'] and linha["Tipo NF"] != ("0" if filtros['tipoNF'] == "Entrada" else "1"):
+            continue
+        if filtros['ncm'] and linha["NCM"] != filtros['ncm']:
+            continue
+        if filtros['codigoProduto'] and linha["Código Produto"] != filtros['codigoProduto']:
+            continue
+
+        dados.append(linha)
+        if not modo_individual:
+            break
+    return dados
+
+@app.post("/gerar-relatorio")
+async def gerar_relatorio(
+    xmls: List[UploadFile] = File(...),
+    modo_linha_individual: bool = Form(False),
+    dataInicio: str = Form(None),
+    dataFim: str = Form(None),
+    cfop: str = Form(None),
+    tipoNF: str = Form(None),
+    ncm: str = Form(None),
+    codigoProduto: str = Form(None)
+):
+    filtros = {
+        'dataInicio': dataInicio,
+        'dataFim': dataFim,
+        'cfop': cfop,
+        'tipoNF': tipoNF,
+        'ncm': ncm,
+        'codigoProduto': codigoProduto
+    }
+
+    todos_dados = []
+    for upload in xmls:
         try:
-            root = ET.fromstring(conteudo)
-            infNFe = root.find('.//nfe:infNFe', NS)
-            protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
-            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
-            xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
+            nome = upload.filename.lower()
+            if nome.endswith('.zip'):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    path_zip = os.path.join(tmpdir, nome)
+                    with open(path_zip, 'wb') as f:
+                        f.write(await upload.read())
 
-            dets = infNFe.findall('nfe:det', NS)
-            for det in dets:
-                linha = {}
-                for campo, titulo in CAMPOS.items():
-                    if campo == 'xMotivo':
-                        linha[titulo] = xMotivo
-                    elif campo == 'chNFe':
-                        linha[titulo] = chNFe
-                    elif campo.startswith('det|'):
-                        linha[titulo] = buscar_valor_xpath(det, campo.replace('det|', ''))
-                    else:
-                        linha[titulo] = buscar_valor_xpath(infNFe, campo)
-
-                data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
-
-                if dataInicio and data_emi < dataInicio:
-                    continue
-                if dataFim and data_emi > dataFim:
-                    continue
-                if cfop and linha["CFOP"] != cfop:
-                    continue
-                if tipoNF and linha["Tipo NF"] != ("0" if tipoNF == "Entrada" else "1"):
-                    continue
-                if ncm and linha["NCM"] != ncm:
-                    continue
-                if codigoProduto and linha["Código Produto"] != codigoProduto:
-                    continue
-
-                dados.append(linha)
-
-                if not modo_linha_individual:
-                    break
-
+                    with zipfile.ZipFile(path_zip, 'r') as zip_ref:
+                        for item in zip_ref.infolist():
+                            if item.filename.endswith('.xml'):
+                                with zip_ref.open(item) as xml_file:
+                                    conteudo = xml_file.read()
+                                    dados = processar_xml(conteudo, filtros, modo_linha_individual)
+                                    todos_dados.extend(dados)
+            else:
+                conteudo = await upload.read()
+                dados = processar_xml(conteudo, filtros, modo_linha_individual)
+                todos_dados.extend(dados)
         except Exception as e:
-            print(f"Erro ao processar XML: {e}")
+            print(f"Erro ao processar {upload.filename}: {e}")
 
-    if not dados:
+    if not todos_dados:
         return JSONResponse(status_code=400, content={"detail": "Nenhum dado encontrado após aplicar os filtros."})
 
-    df = pd.DataFrame(dados)
+    df = pd.DataFrame(todos_dados)
     output = io.BytesIO()
     df.to_excel(output, index=False)
     output.seek(0)
 
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=relatorio_nfe.xlsx"}
-    )
+    return StreamingResponse(output, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": "attachment; filename=relatorio_nfe.xlsx"})
