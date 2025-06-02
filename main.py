@@ -12,7 +12,7 @@ NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 app = FastAPI()
 
 origins = [
-    "https://kxml-x1d5zzmjb-kiligs-projects-7cfc26f2.vercel.app",
+    "https://kxml-1yl0vxrs3-kiligs-projects-7cfc26f2.vercel.app",  # Vercel atual
     "http://localhost:5173"
 ]
 
