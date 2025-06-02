@@ -12,7 +12,7 @@ NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
-# ✅ Permitir origem da Vercel:
+# CORS para frontend Vercel
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -62,10 +62,9 @@ async def gerar_relatorio(
     }
 
     dados = []
-
     arquivos = []
 
-    # ✅ Detectar e extrair .zip automaticamente
+    # Detectar se é ZIP
     if len(xmls) == 1 and xmls[0].filename.endswith('.zip'):
         with tempfile.TemporaryDirectory() as tmpdir:
             zip_path = f"{tmpdir}/{xmls[0].filename}"
@@ -101,7 +100,7 @@ async def gerar_relatorio(
                     else:
                         linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
-                # ✅ Aplicar filtros se fornecidos
+                # Aplicar filtros (somente se preenchidos)
                 data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
                 if dataInicio and data_emi < dataInicio:
                     continue
@@ -123,10 +122,12 @@ async def gerar_relatorio(
         except Exception as e:
             print(f"Erro ao processar XML: {e}")
 
+    # ✅ Geração de Excel mesmo que vazio
     if not dados:
-        return {"detail": "Nenhum dado encontrado após aplicar os filtros."}
+        df = pd.DataFrame([{"AVISO": "Nenhum dado encontrado após aplicar os filtros."}])
+    else:
+        df = pd.DataFrame(dados)
 
-    df = pd.DataFrame(dados)
     output = io.BytesIO()
     df.to_excel(output, index=False)
     output.seek(0)
