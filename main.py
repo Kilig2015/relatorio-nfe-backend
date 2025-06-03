@@ -1,24 +1,21 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse
 from typing import List
+import zipfile, os, shutil, uuid
 import xml.etree.ElementTree as ET
 import pandas as pd
-import io
-import zipfile
-import tempfile
-import os
 from datetime import datetime
 
 NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
+TEMP_DIR = "temp_uploads"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
 app = FastAPI()
 
-from fastapi.middleware.cors import CORSMiddleware
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://kxml.vercel.app"],  # ou ["*"] apenas para testes
+    allow_origins=["https://kxml.vercel.app"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -29,12 +26,6 @@ def buscar_valor_xpath(base, caminho):
     atual = base
     for parte in partes:
         if atual is None:
-            return ''
-        if parte == '*':
-            for subtag in atual:
-                valor = subtag.find(f'nfe:{partes[-1]}', NS)
-                if valor is not None:
-                    return valor.text
             return ''
         atual = atual.find(f'nfe:{parte}', NS)
     return atual.text if atual is not None else ''
@@ -50,6 +41,25 @@ async def gerar_relatorio(
     ncm: str = Form(None),
     codigoProduto: str = Form(None)
 ):
+    session_id = str(uuid.uuid4())
+    session_folder = os.path.join(TEMP_DIR, session_id)
+    os.makedirs(session_folder, exist_ok=True)
+
+    # Extrair arquivos XML (zip ou individuais)
+    for xml in xmls:
+        if xml.filename.endswith('.zip'):
+            with zipfile.ZipFile(xml.file) as zipf:
+                zipf.extractall(session_folder)
+        elif xml.filename.endswith('.xml'):
+            with open(os.path.join(session_folder, xml.filename), 'wb') as f:
+                f.write(await xml.read())
+
+    arquivos_xml = []
+    for root, _, files in os.walk(session_folder):
+        arquivos_xml.extend([
+            os.path.join(root, f) for f in files if f.lower().endswith('.xml')
+        ])
+
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -68,42 +78,18 @@ async def gerar_relatorio(
         "chNFe": "Chave de Acesso",
     }
 
-    arquivos_xml = []
-
-    for upload in xmls:
-        if upload.filename.endswith('.zip'):
-            with tempfile.TemporaryDirectory() as tmpdirname:
-                zip_path = os.path.join(tmpdirname, upload.filename)
-                with open(zip_path, 'wb') as f:
-                    f.write(await upload.read())
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(tmpdirname)
-                    for root_dir, _, files in os.walk(tmpdirname):
-                        for file in files:
-                            if file.endswith('.xml'):
-                                arquivos_xml.append(os.path.join(root_dir, file))
-        elif upload.filename.endswith('.xml'):
-            temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".xml")
-            temp_file.write(await upload.read())
-            temp_file.close()
-            arquivos_xml.append(temp_file.name)
-
     dados = []
 
-    for path in arquivos_xml:
+    for caminho in arquivos_xml:
         try:
-            tree = ET.parse(path)
+            tree = ET.parse(caminho)
             root = tree.getroot()
             infNFe = root.find('.//nfe:infNFe', NS)
             protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
-            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '') if infNFe is not None else ''
+            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
             xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
 
-            if infNFe is None:
-                continue
-
-            dets = infNFe.findall('nfe:det', NS)
-            for det in dets:
+            for det in infNFe.findall('nfe:det', NS):
                 linha = {}
                 for campo, titulo in CAMPOS.items():
                     if campo == 'xMotivo':
@@ -131,22 +117,16 @@ async def gerar_relatorio(
                     continue
 
                 dados.append(linha)
-
-                if not modo_linha_individual:
-                    break
-
         except Exception as e:
-            print(f"Erro ao processar {path}: {e}")
+            print(f"Erro no arquivo {caminho}: {e}")
 
     if not dados:
-        return JSONResponse(status_code=400, content={"detail": "Nenhum dado encontrado após aplicar os filtros."})
+        shutil.rmtree(session_folder, ignore_errors=True)
+        raise HTTPException(status_code=400, detail="Nenhum dado encontrado após aplicar os filtros.")
 
     df = pd.DataFrame(dados)
-    output = io.BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
+    relatorio_path = os.path.join(session_folder, f"relatorio_{session_id}.xlsx")
+    df.to_excel(relatorio_path, index=False)
 
-    return StreamingResponse(output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": "attachment; filename=relatorio_nfe.xlsx"}
-    )
+    return FileResponse(relatorio_path, filename="relatorio_nfe.xlsx")
+
