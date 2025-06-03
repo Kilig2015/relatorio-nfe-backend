@@ -14,9 +14,11 @@ NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://kxml.vercel.app"],
+    allow_origins=["https://kxml.vercel.app"],  # ou ["*"] apenas para testes
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
