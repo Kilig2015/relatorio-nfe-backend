@@ -1,31 +1,34 @@
-from fastapi import FastAPI, UploadFile, File, Form, BackgroundTasks
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from typing import List, Optional
 import os
 import uuid
 import zipfile
 import shutil
-import tempfile
+import io
+from fastapi import FastAPI, File, UploadFile, Form, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from typing import List, Optional
+from datetime import datetime
 import pandas as pd
 import xml.etree.ElementTree as ET
-from datetime import datetime
+
+NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
 
 app = FastAPI()
 
+# Permitir Vercel + testes locais
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://kxml.vercel.app"],
+    allow_origins=["https://kxml.vercel.app", "http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-NS = {'nfe': 'http://www.portalfiscal.inf.br/nfe'}
-PASTA_RESULTADOS = "resultados"
-os.makedirs(PASTA_RESULTADOS, exist_ok=True)
+TEMP_DIR = "temp"
+RESULT_DIR = "resultados"
+os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs(RESULT_DIR, exist_ok=True)
 
-PROCESSAMENTO = {}
 
 def buscar_valor_xpath(base, caminho):
     partes = caminho.split('|')
@@ -42,21 +45,57 @@ def buscar_valor_xpath(base, caminho):
         atual = atual.find(f'nfe:{parte}', NS)
     return atual.text if atual is not None else ''
 
-def extrair_xmls(file: UploadFile, destino: str) -> List[str]:
-    zip_path = os.path.join(destino, file.filename)
-    with open(zip_path, "wb") as f:
-        f.write(file.file.read())
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(destino)
-    os.remove(zip_path)
-    xmls = []
-    for root, _, files in os.walk(destino):
-        for f in files:
-            if f.lower().endswith(".xml"):
-                xmls.append(os.path.join(root, f))
-    return xmls
 
-def processar_xmls(arquivos, filtros, modo_individual, caminho_saida):
+@app.post("/gerar-relatorio")
+async def gerar_relatorio(
+    background_tasks: BackgroundTasks,
+    xmls: List[UploadFile] = File(...),
+    modo_linha_individual: bool = Form(False),
+    dataInicio: Optional[str] = Form(None),
+    dataFim: Optional[str] = Form(None),
+    cfop: Optional[str] = Form(None),
+    tipoNF: Optional[str] = Form(None),
+    ncm: Optional[str] = Form(None),
+    codigoProduto: Optional[str] = Form(None),
+):
+    job_id = str(uuid.uuid4())
+    pasta_job = os.path.join(TEMP_DIR, job_id)
+    os.makedirs(pasta_job, exist_ok=True)
+
+    for file in xmls:
+        if file.filename.lower().endswith('.zip'):
+            with zipfile.ZipFile(file.file) as zip_ref:
+                zip_ref.extractall(pasta_job)
+        elif file.filename.lower().endswith('.xml'):
+            with open(os.path.join(pasta_job, file.filename), "wb") as f:
+                f.write(await file.read())
+
+    background_tasks.add_task(processar_xmls, pasta_job, job_id, modo_linha_individual,
+                              dataInicio, dataFim, cfop, tipoNF, ncm, codigoProduto)
+
+    return {"id": job_id, "status": "processando"}
+
+
+@app.get("/status/{job_id}")
+def verificar_status(job_id: str):
+    caminho_arquivo = os.path.join(RESULT_DIR, f"relatorio_{job_id}.xlsx")
+    if os.path.exists(caminho_arquivo):
+        return {"status": "concluido", "url": f"/download/relatorio_{job_id}.xlsx"}
+    pasta = os.path.join(TEMP_DIR, job_id)
+    if os.path.exists(pasta):
+        return {"status": "processando"}
+    return {"status": "nao_encontrado"}
+
+
+@app.get("/download/relatorio_{job_id}.xlsx")
+def baixar_relatorio(job_id: str):
+    caminho_arquivo = os.path.join(RESULT_DIR, f"relatorio_{job_id}.xlsx")
+    if os.path.exists(caminho_arquivo):
+        return FileResponse(caminho_arquivo, filename=f"relatorio_nfe_{job_id}.xlsx")
+    return JSONResponse(status_code=404, content={"detail": "Arquivo não encontrado."})
+
+
+def processar_xmls(pasta, job_id, modo_individual, dataInicio, dataFim, cfop, tipoNF, ncm, codigoProduto):
     CAMPOS = {
         "ide|nNF": "Número NF",
         "ide|serie": "Série",
@@ -77,116 +116,59 @@ def processar_xmls(arquivos, filtros, modo_individual, caminho_saida):
 
     dados = []
 
-    for path in arquivos:
-        try:
-            tree = ET.parse(path)
-            root = tree.getroot()
-            infNFe = root.find('.//nfe:infNFe', NS)
-            protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
-            chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
-            xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
+    for root_dir, _, files in os.walk(pasta):
+        for nome in files:
+            if not nome.endswith(".xml"):
+                continue
+            try:
+                caminho = os.path.join(root_dir, nome)
+                tree = ET.parse(caminho)
+                root = tree.getroot()
+                infNFe = root.find('.//nfe:infNFe', NS)
+                protNFe = root.find('.//nfe:protNFe/nfe:infProt', NS)
+                chNFe = infNFe.attrib.get('Id', '').replace('NFe', '')
+                xMotivo = buscar_valor_xpath(protNFe, 'xMotivo') if protNFe is not None else ''
+                dets = infNFe.findall('nfe:det', NS)
 
-            dets = infNFe.findall('nfe:det', NS)
-            for det in dets:
-                linha = {}
-                for campo, titulo in CAMPOS.items():
-                    if campo == 'xMotivo':
-                        linha[titulo] = xMotivo
-                    elif campo == 'chNFe':
-                        linha[titulo] = chNFe
-                    elif campo.startswith('det|'):
-                        linha[titulo] = buscar_valor_xpath(det, campo.replace('det|', ''))
-                    else:
-                        linha[titulo] = buscar_valor_xpath(infNFe, campo)
+                for det in dets:
+                    linha = {}
+                    for campo, titulo in CAMPOS.items():
+                        if campo == 'xMotivo':
+                            linha[titulo] = xMotivo
+                        elif campo == 'chNFe':
+                            linha[titulo] = chNFe
+                        elif campo.startswith('det|'):
+                            linha[titulo] = buscar_valor_xpath(det, campo.replace('det|', ''))
+                        else:
+                            linha[titulo] = buscar_valor_xpath(infNFe, campo)
 
-                # Filtros
-                data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
-                if filtros["dataInicio"] and data_emi < filtros["dataInicio"]:
-                    continue
-                if filtros["dataFim"] and data_emi > filtros["dataFim"]:
-                    continue
-                if filtros["cfop"] and linha["CFOP"] != filtros["cfop"]:
-                    continue
-                if filtros["tipoNF"] and linha["Tipo NF"] != ("0" if filtros["tipoNF"] == "Entrada" else "1"):
-                    continue
-                if filtros["ncm"] and linha["NCM"] != filtros["ncm"]:
-                    continue
-                if filtros["codigoProduto"] and linha["Código Produto"] != filtros["codigoProduto"]:
-                    continue
+                    data_emi = linha["Data Emissão"][:10] if linha["Data Emissão"] else ""
 
-                dados.append(linha)
+                    if dataInicio and data_emi < dataInicio:
+                        continue
+                    if dataFim and data_emi > dataFim:
+                        continue
+                    if cfop and linha["CFOP"] != cfop:
+                        continue
+                    if tipoNF and linha["Tipo NF"] != ("0" if tipoNF == "Entrada" else "1"):
+                        continue
+                    if ncm and linha["NCM"] != ncm:
+                        continue
+                    if codigoProduto and linha["Código Produto"] != codigoProduto:
+                        continue
 
-        except Exception as e:
-            print(f"Erro ao processar {path}: {e}")
+                    dados.append(linha)
+                    if not modo_individual:
+                        break
+            except Exception as e:
+                print(f"Erro ao processar {nome}: {e}")
+
+    if not dados:
+        shutil.rmtree(pasta, ignore_errors=True)
+        return
 
     df = pd.DataFrame(dados)
-    if df.empty:
-        raise ValueError("Nenhum dado encontrado após aplicar os filtros.")
+    arquivo_saida = os.path.join(RESULT_DIR, f"relatorio_{job_id}.xlsx")
+    df.to_excel(arquivo_saida, index=False)
 
-    df.to_excel(caminho_saida, index=False)
-
-@app.post("/gerar-relatorio")
-async def gerar_relatorio(
-    background_tasks: BackgroundTasks,
-    xmls: List[UploadFile] = File(...),
-    modo_linha_individual: bool = Form(False),
-    dataInicio: Optional[str] = Form(None),
-    dataFim: Optional[str] = Form(None),
-    cfop: Optional[str] = Form(None),
-    tipoNF: Optional[str] = Form(None),
-    ncm: Optional[str] = Form(None),
-    codigoProduto: Optional[str] = Form(None)
-):
-    filtros = {
-        "dataInicio": dataInicio,
-        "dataFim": dataFim,
-        "cfop": cfop,
-        "tipoNF": tipoNF,
-        "ncm": ncm,
-        "codigoProduto": codigoProduto
-    }
-
-    uid = str(uuid.uuid4())
-    pasta_tmp = os.path.join("temp", uid)
-    os.makedirs(pasta_tmp, exist_ok=True)
-
-    all_xml_paths = []
-    for file in xmls:
-        if file.filename.lower().endswith(".zip"):
-            xml_paths = extrair_xmls(file, pasta_tmp)
-            all_xml_paths.extend(xml_paths)
-        elif file.filename.lower().endswith(".xml"):
-            path = os.path.join(pasta_tmp, file.filename)
-            with open(path, "wb") as f:
-                f.write(file.file.read())
-            all_xml_paths.append(path)
-
-    saida_excel = os.path.join(PASTA_RESULTADOS, f"relatorio_{uid}.xlsx")
-    PROCESSAMENTO[uid] = {"status": "processando", "arquivo": saida_excel}
-
-    def tarefa():
-        try:
-            processar_xmls(all_xml_paths, filtros, modo_linha_individual, saida_excel)
-            PROCESSAMENTO[uid]["status"] = "concluido"
-        except Exception as e:
-            PROCESSAMENTO[uid]["status"] = "erro"
-            PROCESSAMENTO[uid]["erro"] = str(e)
-        finally:
-            shutil.rmtree(pasta_tmp, ignore_errors=True)
-
-    background_tasks.add_task(tarefa)
-    return {"id": uid}
-
-@app.get("/status/{uid}")
-async def status(uid: str):
-    info = PROCESSAMENTO.get(uid)
-    if not info:
-        return JSONResponse(status_code=404, content={"detail": "ID não encontrado."})
-    return info
-
-@app.get("/download/{filename}")
-async def download(filename: str):
-    path = os.path.join(PASTA_RESULTADOS, filename)
-    if not os.path.exists(path):
-        return JSONResponse(status_code=404, content={"detail": "Arquivo não encontrado."})
-    return FileResponse(path, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=filename)
+    shutil.rmtree(pasta, ignore_errors=True)
